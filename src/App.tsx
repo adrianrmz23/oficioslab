@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import type { User } from '@supabase/supabase-js'
 import { electricityTopics, expertSheets, stageGuides } from './electricityContent'
 import type { ElectricityTopic, SafetyLevel } from './electricityContent'
 import { getTradeRoute, tradeRoutes } from './tradeRoutes'
@@ -8,6 +9,8 @@ import { buildStageAssessment, buildTradeLesson, localTutorAnswer, masteryLabels
 import type { MasteryLevel } from './advancedLearning'
 import { deleteEvidence, listEvidence, saveEvidence } from './evidenceStore'
 import type { EvidenceEntry } from './evidenceStore'
+import { getCurrentUser, loadCloudState, mergeProgress, readLocalProgress, saveAssessmentAttempt, saveCloudState, sendEmailOtp, signOutCloud, subscribeToAuth, supabaseConfigured, verifyEmailOtp } from './cloudSync'
+import type { CloudSyncState, OficiosLabState } from './cloudSync'
 import {
   Activity,
   ArrowLeft,
@@ -19,6 +22,8 @@ import {
   BrickWall,
   Calculator,
   Camera,
+  Cloud,
+  CloudOff,
   Check,
   CheckCircle2,
   ChevronRight,
@@ -31,11 +36,14 @@ import {
   HardHat,
   Home,
   Lightbulb,
+  LogOut,
+  Mail,
   LockKeyhole,
   Menu,
   PanelTop,
   PlugZap,
   Ruler,
+  RefreshCw,
   ShieldCheck,
   Sparkles,
   Send,
@@ -563,6 +571,67 @@ export default function App() {
   const [seriesDone, setSeriesDone] = useState(() => localStorage.getItem('oficioslab-series') === 'done')
   const [diagramsDone, setDiagramsDone] = useState(() => localStorage.getItem('oficioslab-diagrams') === 'done')
   const [practiceDone, setPracticeDone] = useState(() => localStorage.getItem('oficioslab-practice-1') === 'done')
+  const [cloudUser, setCloudUser] = useState<User | null>(null)
+  const [cloudStatus, setCloudStatus] = useState<CloudSyncState>(supabaseConfigured ? 'signed-out' : 'local')
+  const [cloudModalOpen, setCloudModalOpen] = useState(false)
+  const cloudHydratedRef = useRef(false)
+
+  const applyCloudState = (state: OficiosLabState) => {
+    setLibraryDone(Array.isArray(state.libraryDone) ? state.libraryDone : [])
+    setMasteryMap((state.masteryMap || {}) as Record<string, MasteryLevel>)
+    setStagePracticeDone(Array.isArray(state.stagePracticeDone) ? state.stagePracticeDone : [])
+    setTradeSkillDone(Array.isArray(state.tradeSkillDone) ? state.tradeSkillDone : [])
+    setTradePracticeDone(Array.isArray(state.tradePracticeDone) ? state.tradePracticeDone : [])
+    setChecked(Array.isArray(state.checked) ? state.checked : [])
+    setLessonDone(Boolean(state.lessonDone))
+    setOhmDone(Boolean(state.ohmDone))
+    setPowerDone(Boolean(state.powerDone))
+    setPolarityDone(Boolean(state.polarityDone))
+    setSeriesDone(Boolean(state.seriesDone))
+    setDiagramsDone(Boolean(state.diagramsDone))
+    setPracticeDone(Boolean(state.practiceDone))
+  }
+
+  useEffect(() => {
+    if (!supabaseConfigured) {
+      setCloudStatus('local')
+      return
+    }
+    let cancelled = false
+    const hydrate = async (user: User | null) => {
+      if (cancelled) return
+      setCloudUser(user)
+      if (!user) {
+        cloudHydratedRef.current = false
+        setCloudStatus('signed-out')
+        return
+      }
+      cloudHydratedRef.current = false
+      setCloudStatus('syncing')
+      try {
+        const local = readLocalProgress()
+        const remote = await loadCloudState(user.id)
+        if (remote?.state) {
+          // El progreso es monotónico: unimos completados y conservamos el mayor nivel de dominio.
+          // Así, una sesión offline en otro dispositivo no se pierde al volver a conectarse.
+          const merged = mergeProgress(local, remote.state)
+          applyCloudState(merged)
+          await saveCloudState(user.id, merged)
+        } else {
+          await saveCloudState(user.id, local)
+        }
+        cloudHydratedRef.current = true
+        setCloudStatus('synced')
+      } catch (error) {
+        console.error('No se pudo hidratar OficiosLab desde Supabase', error)
+        setCloudStatus('error')
+      }
+    }
+    getCurrentUser().then(hydrate)
+    const unsubscribe = subscribeToAuth(hydrate)
+    return () => { cancelled = true; unsubscribe() }
+  }, [])
+
 
   useEffect(() => {
     localStorage.setItem('oficioslab-electricity-library-done', JSON.stringify(libraryDone))
@@ -616,13 +685,58 @@ export default function App() {
     localStorage.setItem('oficioslab-practice-1', practiceDone ? 'done' : 'pending')
   }, [practiceDone])
 
+  const cloudSnapshot = useMemo<OficiosLabState>(() => ({
+    version: 1,
+    libraryDone,
+    masteryMap,
+    stagePracticeDone,
+    tradeSkillDone,
+    tradePracticeDone,
+    checked,
+    lessonDone,
+    ohmDone,
+    powerDone,
+    polarityDone,
+    seriesDone,
+    diagramsDone,
+    practiceDone,
+  }), [libraryDone, masteryMap, stagePracticeDone, tradeSkillDone, tradePracticeDone, checked, lessonDone, ohmDone, powerDone, polarityDone, seriesDone, diagramsDone, practiceDone])
+
+  useEffect(() => {
+    if (!cloudUser || !cloudHydratedRef.current) return
+    const timer = window.setTimeout(async () => {
+      setCloudStatus('syncing')
+      try {
+        await saveCloudState(cloudUser.id, cloudSnapshot)
+        setCloudStatus('synced')
+      } catch (error) {
+        console.error('No se pudo sincronizar OficiosLab', error)
+        setCloudStatus('error')
+      }
+    }, 700)
+    return () => window.clearTimeout(timer)
+  }, [cloudUser, cloudSnapshot])
+
+  const syncNow = async () => {
+    if (!cloudUser) return
+    setCloudStatus('syncing')
+    try {
+      await saveCloudState(cloudUser.id, cloudSnapshot)
+      setCloudStatus('synced')
+    } catch (error) {
+      console.error('No se pudo sincronizar OficiosLab', error)
+      setCloudStatus('error')
+    }
+  }
+
   const stageOneCompleted = 1 + Number(lessonDone) + Number(ohmDone) + Number(powerDone) + Number(polarityDone) + Number(seriesDone) + Number(diagramsDone) + Number(practiceDone)
   const completedSkills = stageOneCompleted + libraryDone.filter(id => { const topic = electricityTopics.find(item => item.id === id); return topic && topic.stage > 1 }).length
   const progress = Math.max(2, Math.round((completedSkills / totalElectricSkills) * 100))
 
   return (
     <div className="app-shell">
-      <Topbar menuOpen={menuOpen} setMenuOpen={setMenuOpen} setView={setView} />
+      <Topbar menuOpen={menuOpen} setMenuOpen={setMenuOpen} setView={setView} cloudUser={cloudUser} cloudStatus={cloudStatus} onCloudClick={() => setCloudModalOpen(true)} />
+      {cloudModalOpen && <CloudSyncModal user={cloudUser} status={cloudStatus} onClose={() => setCloudModalOpen(false)} onSync={syncNow} />}
       <div className="layout">
         <Sidebar view={view} setView={setView} progress={progress} open={menuOpen} close={() => setMenuOpen(false)} completedSkills={completedSkills} />
         <main className="main-content">
@@ -654,7 +768,14 @@ export default function App() {
   )
 }
 
-function Topbar({ menuOpen, setMenuOpen, setView }: { menuOpen: boolean; setMenuOpen: (v: boolean) => void; setView: (v: View) => void }) {
+function Topbar({ menuOpen, setMenuOpen, setView, cloudUser, cloudStatus, onCloudClick }: { menuOpen: boolean; setMenuOpen: (v: boolean) => void; setView: (v: View) => void; cloudUser: User | null; cloudStatus: CloudSyncState; onCloudClick: () => void }) {
+  const cloudLabel = !supabaseConfigured
+    ? 'Solo local'
+    : cloudStatus === 'syncing'
+      ? 'Sincronizando'
+      : cloudUser
+        ? cloudStatus === 'error' ? 'Revisar sync' : 'Sincronizado'
+        : 'Sincronizar'
   return (
     <header className="topbar">
       <button className="menu-btn" onClick={() => setMenuOpen(!menuOpen)} aria-label="Abrir menú">
@@ -667,12 +788,79 @@ function Topbar({ menuOpen, setMenuOpen, setView }: { menuOpen: boolean; setMenu
       <div className="topbar-center">
         <span className="workshop-dot" /> Taller de aprendizaje activo
       </div>
+      <button className={`cloud-status ${cloudStatus}`} onClick={onCloudClick} title="Sincronización entre dispositivos">
+        {cloudUser ? <Cloud size={17}/> : <CloudOff size={17}/>}<span>{cloudLabel}</span>
+      </button>
       <div className="profile-chip">
         <span className="profile-avatar">AR</span>
-        <span className="profile-copy"><strong>Aprendiz</strong><small>Nivel 1</small></span>
+        <span className="profile-copy"><strong>Aprendiz</strong><small>{cloudUser?.email ? 'Cuenta conectada' : 'Nivel 1'}</small></span>
       </div>
     </header>
   )
+}
+
+function CloudSyncModal({ user, status, onClose, onSync }: { user: User | null; status: CloudSyncState; onClose: () => void; onSync: () => Promise<void> }) {
+  const [email, setEmail] = useState(user?.email || '')
+  const [code, setCode] = useState('')
+  const [sent, setSent] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+
+  const requestCode = async () => {
+    if (!email.trim()) return
+    setBusy(true); setError(''); setMessage('')
+    try {
+      await sendEmailOtp(email.trim())
+      setSent(true)
+      setMessage('Código enviado. Revisa el mismo correo que usas en FluentLab.')
+    } catch (err: any) {
+      setError(err?.message || 'No se pudo enviar el código.')
+    } finally { setBusy(false) }
+  }
+
+  const verify = async () => {
+    if (code.trim().length !== 6) return
+    setBusy(true); setError(''); setMessage('')
+    try {
+      await verifyEmailOtp(email.trim(), code.trim())
+      setMessage('Cuenta conectada. Tu progreso local se sincronizará automáticamente.')
+    } catch (err: any) {
+      setError(err?.message || 'El código no pudo verificarse.')
+    } finally { setBusy(false) }
+  }
+
+  const logout = async () => {
+    setBusy(true); setError('')
+    try { await signOutCloud(); onClose() }
+    catch (err: any) { setError(err?.message || 'No se pudo cerrar sesión.') }
+    finally { setBusy(false) }
+  }
+
+  return <div className="cloud-modal-backdrop" role="presentation" onMouseDown={onClose}>
+    <section className="cloud-modal" role="dialog" aria-modal="true" aria-label="Sincronización de OficiosLab" onMouseDown={e => e.stopPropagation()}>
+      <button className="cloud-modal-close" onClick={onClose} aria-label="Cerrar"><X size={18}/></button>
+      <div className="cloud-modal-icon">{user ? <Cloud size={28}/> : <CloudOff size={28}/>}</div>
+      <span className="eyebrow">PROGRESO ENTRE DISPOSITIVOS</span>
+      <h2>{user ? 'Tu progreso está conectado.' : 'Conecta tu cuenta de FluentLab.'}</h2>
+      {!supabaseConfigured ? <>
+        <p>Faltan las variables de Supabase. Añade <code>VITE_SUPABASE_URL</code> y <code>VITE_SUPABASE_PUBLISHABLE_KEY</code> a tu <code>.env</code> local y a Vercel.</p>
+        <div className="cloud-local-note"><CloudOff size={18}/><span>Mientras tanto, OficiosLab seguirá guardando todo localmente.</span></div>
+      </> : user ? <>
+        <p>Sesión: <strong>{user.email || 'usuario autenticado'}</strong>. Los avances se guardan localmente y se reflejan en Supabase; las fotografías se conservan en un bucket privado.</p>
+        <div className={`sync-state-card ${status}`}><span className="sync-dot"/><div><strong>{status === 'syncing' ? 'Sincronizando…' : status === 'error' ? 'Hubo un problema de sincronización' : 'Sincronización activa'}</strong><small>{status === 'error' ? 'Tu copia local sigue intacta. Puedes reintentar.' : 'Los cambios se envían automáticamente después de guardarlos.'}</small></div></div>
+        <div className="cloud-modal-actions"><button className="primary-btn" disabled={busy || status === 'syncing'} onClick={onSync}><RefreshCw size={17}/> Sincronizar ahora</button><button className="secondary-btn" disabled={busy} onClick={logout}><LogOut size={17}/> Cerrar sesión</button></div>
+      </> : <>
+        <p>Usa el mismo correo de tu cuenta de FluentLab. OficiosLab reutiliza ese usuario y mantiene sus tablas totalmente separadas.</p>
+        <label className="cloud-field"><span>Correo</span><div><Mail size={17}/><input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="tu-correo@ejemplo.com" autoComplete="email"/></div></label>
+        {sent && <label className="cloud-field"><span>Código de 6 dígitos</span><input className="otp-input" inputMode="numeric" maxLength={6} value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} placeholder="000000" autoFocus/></label>}
+        {message && <div className="cloud-message success">{message}</div>}
+        {error && <div className="cloud-message error">{error}</div>}
+        <div className="cloud-modal-actions">{sent ? <><button className="primary-btn" disabled={busy || code.length !== 6} onClick={verify}>{busy ? 'Verificando…' : 'Verificar y sincronizar'}</button><button className="secondary-btn" disabled={busy} onClick={requestCode}>Reenviar código</button></> : <button className="primary-btn" disabled={busy || !email.trim()} onClick={requestCode}>{busy ? 'Enviando…' : 'Enviar código'}</button>}</div>
+        <small className="cloud-security-note">La clave pública de Supabase puede estar en el navegador; el acceso real está protegido por Auth + RLS. Tu clave de OpenAI nunca debe usar prefijo VITE_.</small>
+      </>}
+    </section>
+  </div>
 }
 
 function Sidebar({ view, setView, progress, open, close, completedSkills }: { view: View; setView: (v: View) => void; progress: number; open: boolean; close: () => void; completedSkills: number }) {
@@ -2207,12 +2395,15 @@ function AssessmentView({ routeId, stageNumber, setView }: { routeId: string; st
   const evaluate = async () => {
     setLoading(true)
     const prompt = `Actúa como evaluador de OficiosLab. Evalúa una respuesta de formación en ${route.name}, etapa ${stage.title}. No certifiques seguridad ni competencia profesional. Usa esta rúbrica: ${exam.rubric.join('; ')}. Caso: ${exam.scenario}. Respuestas del alumno:\n${answers.map((a,i)=>`${i+1}. ${a}`).join('\n')}\nDevuelve: fortalezas, huecos concretos, 3 preguntas de seguimiento y una puntuación orientativa 0-100 explicada.`
+    let evaluation = ''
     try {
-      const result = await askOficiosAi(prompt)
-      setFeedback(result)
+      evaluation = await askOficiosAi(prompt)
     } catch {
-      setFeedback(`Modo de autoevaluación local. Revisa tu respuesta contra esta rúbrica:\n\n${exam.rubric.map((r,i)=>`${i+1}. ${r}`).join('\n')}\n\nUna respuesta sólida debe incluir decisiones justificadas, mediciones o evidencia, diagnóstico de causas y límites claros de seguridad. Si alguna respuesta depende de “yo creo” sin decir cómo comprobarlo, todavía hay una brecha.`)
-    } finally { setLoading(false) }
+      evaluation = `Modo de autoevaluación local. Revisa tu respuesta contra esta rúbrica:\n\n${exam.rubric.map((r,i)=>`${i+1}. ${r}`).join('\n')}\n\nUna respuesta sólida debe incluir decisiones justificadas, mediciones o evidencia, diagnóstico de causas y límites claros de seguridad. Si alguna respuesta depende de “yo creo” sin decir cómo comprobarlo, todavía hay una brecha.`
+    }
+    setFeedback(evaluation)
+    try { await saveAssessmentAttempt({ routeId, stageNumber, answers, feedback: evaluation }) } catch {}
+    setLoading(false)
   }
 
   return <div className="page-wrap compact assessment-page">
@@ -2310,7 +2501,7 @@ function PortfolioView({ setView }: { setView: (v: View) => void }) {
     const rows = await listEvidence()
     setEntries(rows)
     const next: Record<string,string> = {}
-    rows.forEach(row => { if (row.photo) next[row.id] = URL.createObjectURL(row.photo) })
+    rows.forEach(row => { if (row.photoUrl) next[row.id] = row.photoUrl; else if (row.photo) next[row.id] = URL.createObjectURL(row.photo) })
     setUrls(next)
   }
   useEffect(() => { reload(); return () => Object.values(urls).forEach(url => URL.revokeObjectURL(url)) }, [])

@@ -1,4 +1,4 @@
-# OficiosLab — Bloque 6 · Plataforma de dominio
+# OficiosLab — Plataforma de dominio + sincronización Supabase
 
 Esta versión convierte OficiosLab en una plataforma de entrenamiento utilizable de principio a fin. Ya no se limita a mostrar rutas y marcar lecciones: ahora separa estudio, ejecución, práctica sin guía, diagnóstico, integración y evidencia.
 
@@ -86,7 +86,7 @@ Sin API configurada, la fotografía todavía puede guardarse y el Inspector ofre
 
 ### 6. Portafolio de prácticas
 
-Nueva sección `Portafolio` respaldada por IndexedDB.
+Nueva sección `Portafolio` con enfoque local-first: IndexedDB conserva la copia del dispositivo y, al iniciar sesión, Supabase sincroniza metadatos y fotografías privadas.
 
 Cada evidencia puede conservar:
 
@@ -135,7 +135,7 @@ La IA es opcional. La plataforma funciona sin ella.
 2. Coloca tu clave:
 
 ```env
-OPENAI_API_KEY=sk-proj-...
+OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-5.6-luna
 ```
 
@@ -160,14 +160,26 @@ OficiosLab es una plataforma de formación. Las rutas pueden enseñar teoría, d
 
 Las actividades con red eléctrica, estructura, altura, excavación, gas u otros riesgos relevantes deben transferirse a campo con controles y supervisión apropiados.
 
-## Persistencia
+## Persistencia y sincronización
 
-Se conservan las claves anteriores de progreso de OficiosLab. No es necesario borrar `localStorage` al actualizar desde Bloque 5.
+Se conservan las claves anteriores de progreso de OficiosLab. No es necesario borrar `localStorage`.
 
-Nuevos datos:
+Modo local:
 
-- `oficioslab-mastery-map`: niveles de dominio.
-- IndexedDB `oficioslab-evidence`: fotografías y portafolio.
+- `localStorage` conserva progreso, dominio y materiales.
+- IndexedDB `oficioslab-evidence` conserva fotografías y portafolio.
+
+Modo Supabase:
+
+- `oficioslab_user_state` sincroniza progreso entre dispositivos.
+- `oficioslab_evidence` sincroniza el portafolio.
+- `oficioslab_assessments` conserva intentos de evaluación.
+- Storage privado `oficioslab-evidence` conserva fotografías.
+- RLS limita cada registro al usuario autenticado.
+
+La primera vez que inicias sesión, si todavía no hay estado de OficiosLab en Supabase, se migra automáticamente el progreso local existente. Después se usa sincronización automática con copia local como fallback.
+
+Consulta `SUPABASE_SETUP.md` para ejecutar la migración y configurar variables.
 
 ## Validación realizada
 
@@ -178,3 +190,21 @@ Nuevos datos:
 ## Despliegue opcional en Vercel
 
 También se incluye `api/ai.js` para que `/api/ai` funcione como función serverless al desplegar en Vercel. Configura allí las variables de entorno `OPENAI_API_KEY` y opcionalmente `OPENAI_MODEL`. No coloques la clave en variables que empiecen por `VITE_`.
+
+
+## Supabase compartido con FluentLab
+
+OficiosLab está preparado para reutilizar el mismo proyecto Supabase y el mismo usuario de FluentLab sin mezclar tablas. La interfaz usa Email OTP de 6 dígitos y las tablas nuevas llevan el prefijo `oficioslab_`.
+
+Variables de Vite:
+
+```env
+VITE_SUPABASE_URL=https://TU_PROJECT_REF.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
+```
+
+Ejecuta `supabase/migrations/001_oficioslab_sync.sql` una sola vez en el proyecto de FluentLab.
+
+## Build fix (TS18047)
+
+Se corrigió el estrechamiento de tipo de `supabase` dentro del callback asíncrono de `listEvidence()`. La función ahora conserva una referencia local no nula (`client`) antes de entrar al `Promise.all`, evitando el error `TS18047: supabase is possibly null`.
